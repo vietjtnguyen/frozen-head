@@ -71,12 +71,15 @@
   }
   #empty code { background: #2d333b; padding: 1px 4px; border-radius: 3px; }
   #err { color: #ff7b72; padding: 20px 40px; display: none; }
+  body.dropping #view { outline: 3px dashed var(--accent); outline-offset: -3px; }
 </style>
 </head>
 <body>
 
 <div id="bar">
-  <label>Image <input type="text" id="src" placeholder="URL or path of a PNG / SVG sequence diagram" spellcheck="false"></label>
+  <label>Image <input type="text" id="src" placeholder="URL or path of a PNG / SVG sequence diagram, or drop a file anywhere" spellcheck="false"></label>
+  <button id="open" title="Open a local image file (or drag one onto the page)">Open file&hellip;</button>
+  <input type="file" id="file" accept="image/*" hidden>
   <label title="Frozen strip = image rows [top, top + height), in image pixels at 100%. Rows above `top` are dropped entirely. Drag the strip up/down to change top; drag the blue bar to change height.">
     Header top <input type="number" id="top" min="0" step="10">
     height <input type="number" id="header" min="0" step="10"> <span class="muted">px</span>
@@ -94,7 +97,8 @@
 
 <div id="view">
   <div id="empty">
-    <p>Give this page an image to show, via query string or hash:</p>
+    <p>Drop an image file anywhere on this page, use <em>Open file&hellip;</em>,
+       or give it an image URL via query string or hash:</p>
     <p><code>?src=/internal/2026-11-02/ms-a2-secure-boot-chains/diagrams/3-this-repo.png</code></p>
     <p>Optional: <code>&amp;top=0</code> (image rows above this are dropped),
        <code>&amp;header=260</code> (image px frozen below that),
@@ -129,6 +133,9 @@
   // topPx is the first image row shown; rows above it are dropped (they are
   // typically a title line and padding that only cost viewing space).
   const st = { src: '', topPx: 0, headerPx: 260, zoom: 100, natW: 0, natH: 0 };
+  // A dropped / picked file is shown through a blob: URL, which cannot be
+  // persisted or shared, so the hash records the name only for information.
+  let blobURL = null;
 
   // ---- URL <-> state ------------------------------------------------------
   // Read query string first, then hash (hash wins). Write back to the hash
@@ -149,7 +156,8 @@
     clearTimeout(writeTimer);
     writeTimer = setTimeout(() => {
       const h = new URLSearchParams();
-      if (st.src) h.set('src', st.src);
+      if (st.src && !blobURL) h.set('src', st.src);
+      else if (blobURL) h.set('file', st.src);
       h.set('top', Math.round(st.topPx));
       h.set('header', Math.round(st.headerPx));
       h.set('zoom', +st.zoom.toFixed(1));
@@ -216,6 +224,14 @@
   }
 
   function load(src) {
+    if (blobURL) { URL.revokeObjectURL(blobURL); blobURL = null; }
+    let url = src;
+    // Duck-typed rather than instanceof File: a File handed over from another
+    // window (iframe, extension) has a different File constructor.
+    if (src && typeof src === 'object') {
+      blobURL = url = URL.createObjectURL(src);
+      src = src.name;
+    }
     st.src = src;
     srcIn.value = src;
     $('err').style.display = 'none';
@@ -224,7 +240,7 @@
     const probe = new Image();
     probe.onload = () => {
       st.natW = probe.naturalWidth; st.natH = probe.naturalHeight;
-      topImg.src = src; main.src = src;
+      topImg.src = url; main.src = url;
       canvas.hidden = false;
       applyLayout();
       if (st.x != null) view.scrollLeft = st.x * st.zoom / 100;
@@ -237,11 +253,33 @@
       const e = $('err'); e.style.display = 'block';
       e.textContent = 'Could not load image: ' + src;
     };
-    probe.src = src;
+    probe.src = url;
   }
 
   // ---- Controls -----------------------------------------------------------
   srcIn.addEventListener('change', () => load(srcIn.value.trim()));
+  $('open').onclick = () => $('file').click();
+  $('file').addEventListener('change', e => { if (e.target.files[0]) load(e.target.files[0]); });
+
+  // Drag a file from the desktop onto any part of the page. dragenter/leave
+  // fire for every child element, so count them to know when we really left.
+  let dragDepth = 0;
+  document.addEventListener('dragenter', e => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault(); dragDepth++; document.body.classList.add('dropping');
+  });
+  document.addEventListener('dragover', e => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
+  });
+  document.addEventListener('dragleave', () => {
+    if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dropping'); }
+  });
+  document.addEventListener('drop', e => {
+    e.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping');
+    const f = [...e.dataTransfer.files].find(f => f.type.startsWith('image/'));
+    if (f) load(f);
+  });
   headerIn.addEventListener('change', () => setHeader(parseFloat(headerIn.value) || 0));
   topIn.addEventListener('change', () => setTop(parseFloat(topIn.value) || 0));
   zoomIn.addEventListener('change', () => setZoom(parseFloat(zoomIn.value) || 100));
