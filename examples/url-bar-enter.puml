@@ -1,0 +1,244 @@
+@startuml url-bar-enter
+' What happens between pressing Enter in the browser's URL bar and pixels on
+' screen, as one sequence diagram: browser processes, the Linux socket API and
+' network stack, the Wi-Fi NIC, the home router, the ISP, DNS, the CDN edge and
+' the origin. Written as an example for the frozen-head viewer, so it is
+' deliberately long and wide; the lane headers are what the frozen strip keeps.
+'
+' Addresses are RFC 5737 / RFC 1918 documentation values. IPv4 is drawn; the
+' IPv6 path differs where noted (no NAT, NDP instead of ARP, AAAA records).
+'
+' Render: java -DPLANTUML_LIMIT_SIZE=32768 -jar plantuml.jar -tpng url-bar-enter.puml
+' The default limit silently clips the PNG at 4096 px; this one is over 10000.
+
+title What happens when you press Enter in the URL bar: https://www.example.com/ from a Linux laptop on Wi-Fi
+
+skinparam maxMessageSize 280
+skinparam sequenceMessageAlign left
+skinparam BoxPadding 8
+skinparam noteFontSize 11
+skinparam defaultFontSize 12
+skinparam sequence {
+  ArrowThickness 1
+  LifeLineBorderColor #999999
+  GroupBorderColor #666666
+  DividerBackgroundColor #e8e8e8
+}
+autonumber
+
+actor "User" as USR
+
+box "Browser (multi-process, Chromium-style)" #f3f6fb
+  participant "Browser process\n(omnibox, navigation,\ntabs, history, cookie jar)" as UI
+  participant "Network service\n(URL parse, HSTS, HTTP cache,\nhost cache, socket pool,\nTLS, HTTP/2 framing)" as NET
+  participant "Renderer process\n(HTML parser, DOM, CSSOM,\nJS engine, style, layout, paint)" as REN
+  participant "Compositor / GPU process\n(raster, tiles, frame submit,\nvsync, swap)" as GPU
+end box
+
+box "Linux on the laptop (192.168.1.42, wlan0)" #fbf7ee
+  participant "Userspace resolver\n(glibc getaddrinfo, nsswitch,\n/etc/hosts, systemd-resolved\nstub 127.0.0.53)" as RES
+  participant "Kernel socket + TCP/IP\n(socket API, TCP/UDP, IP,\nrouting table, neighbor cache,\nnetfilter/conntrack)" as KSTK
+  participant "Kernel netdev + driver\n(qdisc fq_codel, mac80211,\niwlwifi, TX/RX rings, NAPI)" as KDRV
+  participant "Wi-Fi NIC\n(firmware, 802.11 MAC,\nCCMP AES crypto, radio)" as NIC
+end box
+
+box "Home network" #eef7ee
+  participant "Access point / router\n(192.168.1.1, public 203.0.113.7:\n802.11 AP, bridge, NAT, firewall,\nDHCP, dnsmasq DNS forwarder)" as AP
+end box
+
+box "Internet" #f7eef3
+  participant "ISP access + core\n(DOCSIS/GPON/DSL termination,\nBNG, BGP routers)" as ISP
+  participant "Recursive DNS resolver\n(ISP's, or 1.1.1.1 / 8.8.8.8;\ncache, DNSSEC validation)" as RDNS
+  participant "Authoritative DNS\n(root, .com TLD,\nexample.com nameservers)" as ADNS
+  participant "Transit / peering\n(IXP, backbone routers,\nBGP paths, anycast)" as CORE
+end box
+
+box "www.example.com (198.51.100.17 anycast)" #f3eefb
+  participant "CDN edge / load balancer\n(TLS termination, HTTP cache,\nHTTP/2, WAF)" as EDGE
+  participant "Origin web server\n(nginx, app server,\ndatabase)" as ORIG
+end box
+
+note over USR, ORIG
+  **Starting state.** The laptop has associated and authenticated with the AP (WPA2/WPA3 4-way handshake done, CCMP pairwise
+  key installed in the NIC), DHCP gave it 192.168.1.42, default route via 192.168.1.1, DNS = 127.0.0.53 (systemd-resolved
+  stub) which forwards to the router. The router's WAN side has 203.0.113.7 from the ISP. The browser has never visited
+  www.example.com, so every cache below misses. The page is **https://www.example.com/**, a plain HTML document with one
+  stylesheet, one script, one image and one web font, all served from the same host through a CDN.
+end note
+
+== 0. Before Enter: typing in the omnibox ==
+
+USR -> UI : keystrokes: w, w, w, ., e, x, a, m …
+UI -> UI : omnibox autocomplete on every keystroke: history, bookmarks, open tabs, search-engine suggestions (sent to the default search provider over its own HTTPS connection); ranks "www.example.com"
+UI -> NET : speculative **DNS prefetch** / **preconnect** to the top suggestion
+note right of NET
+  A preconnect would already run sections 2, 3 and 4 while the user is still
+  typing. The rest of the diagram assumes it did not happen, so every step is
+  shown once, in order.
+end note
+
+== 1. Enter: the browser decides what the text means ==
+
+USR -> UI : **Enter**
+UI -> UI : classify input: URL or search query? Has a dot, no spaces, resolves as a hostname → URL. No scheme typed → prepend http://; IDN hosts → punycode; WHATWG URL parsing and normalisation (lowercase host, percent-encoding, default port removed)
+UI -> NET : HSTS lookup for www.example.com: preload list (compiled into the browser) and dynamic HSTS store
+NET --> UI : **HSTS hit → upgrade to https://www.example.com/** (no plaintext request is ever made)
+UI -> UI : pick a renderer: site isolation gives example.com its own process (spawn one now, or reuse a spare); fire **beforeunload** on the old document; start the throbber; show the typed URL in the omnibox
+UI -> NET : create navigation request: GET https://www.example.com/ with headers: Host, User-Agent, Accept: text/html,…, Accept-Language, Accept-Encoding: gzip, deflate, br, zstd, Sec-Fetch-Dest: document, Sec-Fetch-Mode: navigate, Upgrade-Insecure-Requests: 1, and cookies for example.com from the jar (**none yet**)
+NET -> NET : **HTTP cache** lookup (disk cache, keyed by URL + top-frame site partition): miss. A fresh hit would skip the network; a stale entry with ETag / Last-Modified would become a conditional request (If-None-Match)
+NET -> NET : proxy resolution (system settings / PAC): DIRECT. **Socket pool**: any idle connection to www.example.com:443 with ALPN h2? none
+NET -> NET : **host cache** lookup for www.example.com: miss
+note right of NET
+  Chromium and Firefox have their own async DNS client and may use
+  DNS-over-HTTPS instead of the OS resolver; DoH would replace section 2
+  with an HTTPS exchange shaped like sections 3 to 5 to the DoH server.
+  The classic OS resolver path is drawn.
+end note
+
+== 2. Name resolution: www.example.com → IP address ==
+
+NET -> RES : getaddrinfo("www.example.com", NULL, AF_UNSPEC, SOCK_STREAM) on a worker thread (blocking call)
+RES -> RES : /etc/nsswitch.conf hosts line: files, mymachines, resolve, dns → **files**: /etc/hosts has no entry
+RES -> RES : **resolve**: nss-resolve hands the query to systemd-resolved over D-Bus / varlink; resolved's cache: miss; per-link DNS server for wlan0 = 192.168.1.1 (from DHCP)
+RES -> KSTK : socket(AF_INET, SOCK_DGRAM, 0) → fd; sendto(fd, DNS query id 0x1a2b "www.example.com A?", to 192.168.1.1:53); a second sendto for **AAAA**
+KSTK -> KSTK : pick ephemeral source port 51234; **route lookup** (FIB): 192.168.1.1 is on-link via wlan0, src 192.168.1.42; build UDP + IPv4 headers (TTL 64, id, checksum offload flags)
+KSTK -> KSTK : **neighbor cache** for 192.168.1.1: STALE/REACHABLE entry with the router's MAC (if missing: ARP who-has 192.168.1.1 broadcast → router replies is-at; IPv6 would use NDP neighbor solicitation)
+KSTK -> KSTK : netfilter OUTPUT / POSTROUTING hooks (nftables rules, conntrack creates a UDP entry)
+KSTK -> KDRV : dev_queue_xmit(skb): enqueue on wlan0's **qdisc** (fq_codel), dequeue → ndo_start_xmit
+KDRV -> KDRV : **mac80211**: wrap the Ethernet payload in an 802.11 data frame (ToDS=1, addr1=BSSID, addr2=laptop MAC, addr3=router MAC), QoS tag, sequence number; hardware does CCMP so the frame is passed plaintext with a key index
+KDRV -> NIC : fill a TX descriptor on the ring (DMA address of the skb data), ring the doorbell register (MMIO)
+NIC -> NIC : DMA the frame from host memory; firmware encrypts with the pairwise CCMP key (AES-CCM, PN counter); **CSMA/CA**: clear channel assessment, random backoff, then transmit on the 5 GHz channel (OFDM, chosen MCS rate)
+NIC -> AP : 802.11 data frame over the air
+AP -> NIC : 802.11 **ACK** (no ACK within SIFS → retransmit with a bigger backoff)
+NIC -> KDRV : TX completion interrupt: descriptor done, free the skb
+AP -> AP : decrypt CCMP with the laptop's pairwise key, replay check on PN; bridge 802.11 → 802.3; destination IP is the router itself → local delivery to **dnsmasq** on :53; dnsmasq cache: miss
+AP -> ISP : dnsmasq forwards the query to the upstream resolver given by the ISP (or a configured 1.1.1.1); NAT: src 192.168.1.1:… → 203.0.113.7:40001, conntrack UDP entry; framed for the access link (DOCSIS MAC / GPON GEM / PPPoE)
+ISP -> ISP : access termination (CMTS / OLT / DSLAM) → BNG: subscriber session, policing, accounting; IP routing from here on: each router decrements TTL, longest-prefix match in its FIB
+ISP -> RDNS : query reaches the **recursive resolver**
+RDNS -> RDNS : cache lookup "www.example.com A": miss (or TTL expired)
+RDNS -> ADNS : query a **root server** (root hints already primed): "www.example.com A?" → referral: NS records for **.com** (a.gtld-servers.net …) plus glue A/AAAA
+RDNS -> ADNS : query a **.com TLD server** → referral: NS for example.com (a.iana-servers.net, b.iana-servers.net) plus glue; DS record for DNSSEC
+RDNS -> ADNS : query an **example.com authoritative** server → answer: **www.example.com A 198.51.100.17** (TTL 300), RRSIG
+RDNS -> RDNS : DNSSEC validation: RRSIG → DNSKEY → DS chain up to the root trust anchor; set AD bit; cache every record by its TTL
+RDNS --> ISP : response id 0x1a2b, A 198.51.100.17 (AAAA answered the same way on its own query)
+ISP --> AP : routed back to 203.0.113.7
+AP -> AP : conntrack match → reverse NAT; dnsmasq caches the answer (TTL 300) and replies to 192.168.1.42:51234; 802.3 → 802.11 frame, encrypt with the laptop's key
+AP -> NIC : 802.11 data frame (FromDS=1)
+NIC -> KDRV : firmware decrypts, DMA into an **RX ring** buffer, raise MSI-X interrupt; driver schedules **NAPI**; poll: pull frames off the ring, mac80211 strips 802.11 → Ethernet, netif_receive_skb
+KDRV -> KSTK : ip_rcv → netfilter PREROUTING / INPUT (conntrack matches the UDP entry) → ip_local_deliver → udp_rcv → **socket lookup** (dst port 51234) → sk_receive_queue; wake the sleeping recvfrom
+KSTK --> RES : recvfrom returns the response; systemd-resolved checks id + question, caches, answers nss-resolve
+RES --> NET : getaddrinfo returns an addrinfo list: [2001:db8::17]:443, 198.51.100.17:443, sorted by RFC 6724 (IPv6 preferred when it has a route)
+NET -> NET : insert into the host cache (Chromium caps TTL at 60 s)
+
+== 3. TCP: three-way handshake to port 443 ==
+
+note right of NET
+  Happy Eyeballs (RFC 8305): the browser starts the IPv6 connect first and
+  the IPv4 one ~250 ms later, keeps whichever completes first. IPv4 is
+  drawn, since the home router NATs it; IPv6 would skip the NAT steps.
+end note
+NET -> KSTK : socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0); setsockopt TCP_NODELAY, SO_KEEPALIVE; **connect**(198.51.100.17:443) → returns **EINPROGRESS**; epoll_ctl(EPOLLOUT)
+KSTK -> KSTK : allocate ephemeral port 50123; route lookup → default route via 192.168.1.1 dev wlan0; random ISN; build **SYN** with options: MSS 1460, SACK permitted, window scale 7, timestamps; start the SYN retransmit timer (1 s, doubling); socket state **SYN_SENT**
+KSTK -> KDRV : skb → netfilter OUTPUT (conntrack NEW) → qdisc → driver (same TX path as the DNS query)
+KDRV -> NIC : TX descriptor + doorbell
+NIC -> AP : 802.11 data frame carrying the SYN; AP ACKs at the 802.11 layer
+AP -> AP : **NAT**: new conntrack entry TCP SYN_SENT, 192.168.1.42:50123 ↔ 203.0.113.7:50123 ↔ 198.51.100.17:443; firewall: outbound allowed; rewrite src IP/port, recompute checksums; TTL 64 → 63
+AP -> ISP : SYN on the access link (upstream grant / timeslot), to the BNG
+ISP -> ISP : BNG → core routers: FIB lookup for 198.51.100.0/24 (learned by BGP), ECMP hash on the 5-tuple picks one of several equal paths; TTL-- at every hop
+ISP -> CORE : hand off at a **peering point** (IXP port or private interconnect, chosen by BGP policy: local-pref, AS-path length); a few backbone hops, each TTL--
+CORE -> EDGE : 198.51.100.17 is **anycast**: BGP delivers the packet to the nearest CDN PoP; the PoP's edge router ECMPs to a load balancer; consistent hashing (Maglev-style) picks one TLS-terminating server
+EDGE -> EDGE : listening socket on :443 (SO_REUSEPORT across workers); SYN queue entry or **SYN cookie**; choose its own ISN; reply **SYN-ACK** with MSS 1460, SACK, wscale, timestamps
+EDGE --> CORE : SYN-ACK (the return path can differ from the forward path: asymmetric routing is normal)
+CORE --> ISP : SYN-ACK
+ISP --> AP : SYN-ACK to 203.0.113.7:50123
+AP -> AP : conntrack lookup on the reply tuple → de-NAT dst to 192.168.1.42:50123; entry → SYN_RECV; forward over Wi-Fi
+AP -> NIC : 802.11 frame
+NIC -> KDRV : RX ring, interrupt, NAPI poll, netif_receive_skb
+KDRV -> KSTK : ip_rcv → tcp_v4_rcv → socket lookup (4-tuple) → tcp_rcv_state_process: valid SYN-ACK (ack = ISN+1) → state **ESTABLISHED**; RTT sample seeds RTO; initial cwnd 10 MSS; send the final **ACK**
+KSTK -> KDRV : ACK → qdisc → NIC → AP (conntrack → ESTABLISHED) → ISP → CORE → EDGE (edge socket moves from the accept queue to the worker: accept() returns)
+KSTK --> NET : epoll reports **EPOLLOUT** on the fd; getsockopt(SO_ERROR) = 0 → connect() succeeded; the socket joins the pool as "in use"
+
+== 4. TLS 1.3 handshake (one round trip) ==
+
+NET -> NET : build **ClientHello**: random, TLS 1.2 legacy version + supported_versions [1.3], cipher suites (AES-128-GCM-SHA256, AES-256-GCM-SHA384, ChaCha20-Poly1305), **SNI = www.example.com**, **ALPN [h2, http/1.1]**, key_share X25519 (plus an ML-KEM hybrid share if enabled), signature_algorithms, supported_groups, PSK key exchange modes, status_request (OCSP), SCT; Encrypted ClientHello if the DNS HTTPS record advertised a key
+NET -> KSTK : write(fd, ClientHello record): copied into the socket send buffer, segmented to MSS (TCP_NODELAY: no Nagle delay), sent within cwnd
+KSTK ->> EDGE : TCP segment(s) along the section 3 path: qdisc → NIC → Wi-Fi → AP NAT → ISP → peering → anycast edge
+EDGE -> EDGE : parse ClientHello; select certificate by SNI; pick AES-128-GCM-SHA256 and X25519; generate its key share; ECDHE shared secret; HKDF-Extract/Expand → **handshake traffic secrets**; transcript hash
+EDGE --> NET : **ServerHello** (random, chosen suite, key_share) in the clear, then encrypted with handshake keys: EncryptedExtensions (ALPN = **h2**), **Certificate** (leaf for www.example.com + intermediate, stapled OCSP response, embedded SCTs), **CertificateVerify** (ECDSA P-256 signature over the transcript), **Finished** (HMAC over the transcript); NewSessionTicket follows after the client's Finished
+NET -> NET : derive the same handshake secrets from the server's key share; decrypt
+NET -> NET : **verify the certificate chain**: build a path to a root in the browser/OS trust store; check SAN names match www.example.com, validity dates, key usage, EKU serverAuth, signature algorithms; revocation via the stapled OCSP response and CRLSet; **Certificate Transparency**: at least two valid SCTs from known logs; verify CertificateVerify against the leaf's public key
+NET -> NET : verify the server Finished; derive **application traffic secrets** (client and server), plus exporter and resumption master secrets
+NET -> KSTK : write(client **Finished**, encrypted with the client handshake key) — the client can now send application data (1-RTT)
+KSTK ->> EDGE : TCP segment
+EDGE -> EDGE : verify client Finished; switch to application keys
+EDGE --> NET : **NewSessionTicket** (PSK identity + ticket lifetime, max_early_data_size) stored by the browser for 0-RTT resumption on the next visit
+note right of NET
+  TLS 1.2 would need a second round trip (ServerHelloDone, ClientKeyExchange,
+  ChangeCipherSpec). QUIC / HTTP/3 would fold sections 3 and 4 into a single
+  round trip over UDP. On a repeat visit, a PSK ticket allows 0-RTT data.
+end note
+
+== 5. HTTP/2 request, CDN, origin, response ==
+
+NET -> NET : ALPN chose h2: write the connection preface "PRI * HTTP/2.0" and a **SETTINGS** frame (HEADER_TABLE_SIZE, MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, ENABLE_PUSH 0); all of it as TLS records (AES-GCM, up to 16 KiB plaintext each)
+EDGE --> NET : SETTINGS, SETTINGS ACK, WINDOW_UPDATE on stream 0
+NET -> EDGE : **stream 1, HEADERS frame** (HPACK-compressed, END_HEADERS + END_STREAM): :method GET, :scheme https, :authority www.example.com, :path /, user-agent, accept, accept-encoding: gzip, deflate, br, zstd, accept-language, sec-fetch-* , upgrade-insecure-requests
+EDGE -> EDGE : TLS decrypt → h2 framing → HPACK decode; **WAF / rate limit / bot rules**; compute the cache key (scheme + host + path + Vary'd headers); **edge cache: MISS**
+EDGE -> ORIG : origin fetch on a separate, long-lived (often mutually authenticated TLS) connection to the origin pool: GET / with Host: www.example.com, X-Forwarded-For: 203.0.113.7, X-Forwarded-Proto: https, Via
+ORIG -> ORIG : nginx: accept, TLS terminate, server_name match, location / → reverse-proxy to the app server (uWSGI / Node / Go) over a Unix socket; app: route match, session cookie lookup (none), **database queries**, template render; nginx applies gzip/brotli, adds headers
+ORIG --> EDGE : **200 OK**, Content-Type: text/html; charset=utf-8, Content-Encoding: br, Content-Length, ETag, Last-Modified, Cache-Control: public, max-age=600, Vary: Accept-Encoding, Strict-Transport-Security, Content-Security-Policy, Set-Cookie: session=…; HttpOnly; Secure; SameSite=Lax
+EDGE -> EDGE : store the object in the edge cache under the cache key (max-age 600); add Age: 0, X-Cache: MISS; HPACK-encode the response headers
+EDGE --> NET : stream 1: **HEADERS** (:status 200 …), then **DATA** frames carrying the brotli body, END_STREAM on the last; flow control: the client's WINDOW_UPDATE frames open the stream and connection windows as it consumes
+note over KSTK, NIC
+  **Receive path, drawn once in detail for the response.** The same steps
+  delivered every packet above, from the DNS answer onward.
+end note
+EDGE ->> NIC : TCP segments (full-size, 1460 B payload each, sent within the edge's cwnd; paced) across CORE, ISP, the AP (conntrack de-NAT) and the air
+NIC -> KDRV : frames DMA'd into RX ring buffers; **interrupt coalescing** batches several; MSI-X → napi_schedule; the NAPI poll pulls up to its budget off the ring; **GRO** merges consecutive in-order segments of one flow into one big skb
+KDRV -> KSTK : netif_receive_skb → ip_rcv → PREROUTING → ip_local_deliver → **tcp_v4_rcv**: 4-tuple lookup, checksum (offloaded), in-order segments appended to sk_receive_queue, out-of-order ones to the OOO queue with **SACK** blocks in the ACKs; delayed ACK (one per two full segments or 40 ms); **receive window autotuning** grows tcp_rmem as the app keeps up
+KSTK -> KDRV : ACKs (with SACK, timestamps, window) back out through the TX path so the edge's cwnd keeps growing (slow start, then congestion avoidance; CUBIC or BBR on the sender)
+KSTK --> NET : epoll reports **EPOLLIN**; read(fd, buf, 32 KiB) copies from the receive queue to userspace (copy_to_user) and returns the byte count
+NET -> NET : TLS record layer: reassemble 16 KiB records, AES-GCM decrypt + tag check; h2 framing: HEADERS → HPACK decode; DATA → body bytes; send WINDOW_UPDATE as the body is drained
+NET -> NET : **Set-Cookie** → cookie jar (Secure, HttpOnly, SameSite checks, public-suffix check on Domain); **Strict-Transport-Security** → dynamic HSTS store; begin writing headers + body to the **HTTP cache** (streams as it arrives)
+NET --> UI : response headers are in: status 200, MIME type text/html (sniffing not needed), CSP parsed, no redirect → **commit the navigation**
+UI -> REN : CommitNavigation IPC: create the new Document in the site-isolated renderer, hand it a data pipe for the body; the old document gets pagehide / unload and is torn down (or enters the back-forward cache); push a history entry; omnibox shows the final URL and the lock icon
+
+== 6. Parsing, subresources, script, style, layout, paint ==
+
+NET ->> REN : body bytes stream through the data pipe (brotli-decoded by the network service)
+REN -> REN : byte-stream decoder picks the encoding (Content-Type charset, BOM, <meta charset>) → **HTML tokenizer** → tree builder → **DOM** nodes; parse is incremental: it runs as bytes arrive
+REN -> REN : **speculative preload scanner** runs ahead of the tree builder on the raw tokens and finds <link rel=stylesheet href=style.css>, <script src=app.js>, <img src=logo.png>, <link rel=preload as=font href=font.woff2>
+REN -> NET : fetch style.css, app.js, logo.png, font.woff2 (priorities: CSS and parser-blocking JS highest, font high, image low); same origin → **reuse the h2 connection** as new streams; checks on the way: CSP, mixed content, CORS mode (font is CORS), cookies attached per SameSite rules
+NET -> EDGE : streams 3, 5, 7, 9: HEADERS frames, multiplexed on the one TLS/TCP connection, with h2 priority / extensible priorities hints
+EDGE --> NET : responses interleaved as DATA frames; style.css, app.js and logo.png are **edge cache HITs** (Age: 412), font.woff2 is a MISS and fetched from the origin as in section 5
+NET --> REN : bytes for each stream via data pipes; HTTP cache written for each
+REN -> REN : **CSS parse** → stylesheet rules → CSSOM; a stylesheet in <head> is render-blocking and also blocks execution of the following <script>, because that script could read computed styles
+REN -> REN : <script src=app.js> (classic, no async/defer): **parser pauses** until the script is fetched and run: V8 parses → bytecode → interpreter (Ignition), hot functions JIT-compiled (Sparkplug/Maglev/TurboFan); the script touches the DOM through bindings; async/defer scripts would not block
+REN -> REN : parser resumes to </html>; defer scripts run; **DOMContentLoaded** fires; microtasks and queued tasks run on the main thread event loop
+REN -> REN : **style recalc**: match selectors against every element, cascade, inherit, compute values; **layout** (LayoutNG: block, inline, flex, grid; text shaping with HarfBuzz; line breaking); **pre-paint** builds the property trees (transform, clip, effect, scroll); **paint** records display-item lists per paint chunk; compositing decides which content gets its own layer (scrollers, will-change, animations)
+REN -> GPU : **commit**: the main thread hands the layer tree, property trees and display lists to the compositor thread (cc), which assigns tile priorities by viewport distance
+GPU -> GPU : **raster** the visible tiles with Skia on the GPU (Vulkan / GL via ANGLE), upload as textures; the compositor builds draw quads for each layer
+GPU -> GPU : submit a **CompositorFrame** to the display compositor (viz); on the next **vsync** it draws the frame to the swap chain and presents through the display server (Wayland compositor or X11) → **KMS atomic commit** → the display controller scans out the framebuffer
+GPU --> USR : **first paint / first contentful paint**: www.example.com's header and text are on the screen
+REN -> REN : font.woff2 arrives (within the 3 s block period, so text that was invisible or in a fallback font gets reshaped: **relayout + repaint**); logo.png is decoded off the main thread, then painted; each change → another commit → raster → frame
+REN -> REN : every subresource is done → **load** event; onload handlers, analytics beacons, service worker registration (navigator.serviceWorker.register), rel=prefetch hints for the next page
+REN -> UI : document title and favicon (/favicon.ico fetched through the network service) → tab title and icon; throbber stops; history and visited-link state updated
+
+== 7. Afterwards: idle, reuse, teardown ==
+
+NET -> NET : the h2 connection stays in the **socket pool** as idle; the next request to www.example.com (a link click, a prefetch) reuses it with no DNS, TCP or TLS cost
+EDGE --> NET : some minutes later the edge sends **GOAWAY** (graceful drain) or simply times out the idle connection
+NET -> KSTK : close(fd) → **FIN**; FIN/ACK exchange with the edge; the active closer sits in **TIME_WAIT** for 60 s; conntrack on the router moves the entry to TIME_WAIT then drops it
+KSTK --> AP : (nothing on the wire while idle; the Wi-Fi NIC may enter power save, buffering at the AP until the next beacon's TIM bit wakes it)
+RDNS -> RDNS : the A record expires from the resolver cache after its 300 s TTL; the next lookup repeats the authoritative walk from whichever level is still cached
+NET -> NET : the HTTP cache entry for / expires after max-age 600; a later navigation sends a conditional request with If-None-Match and expects **304 Not Modified**
+
+note over USR, ORIG
+  **Round trips before the first byte of HTML, cold start:** DNS (one or more, usually hidden by the resolver's cache) + TCP (1) + TLS 1.3 (1)
+  + HTTP request/response (1) ≈ 3 to 4 RTTs, plus the origin fetch on a CDN cache miss. Everything in sections 0, 4 and 7 that mentions
+  prefetch, preconnect, session tickets, 0-RTT, HTTP/3 and edge caching exists to remove one of those round trips. The kernel, NIC, AP
+  and ISP steps run for every single packet shown; they were drawn in full for the DNS query, the SYN and the HTML response, and
+  abbreviated elsewhere.
+end note
+
+@enduml
