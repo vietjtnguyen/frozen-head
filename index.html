@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sequence diagram viewer</title>
+<style>
+  :root {
+    --bar-bg: #1f2428; --bar-fg: #d7dde3; --bar-muted: #8b949e;
+    --accent: #58a6ff; --page-bg: #3a3f44;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column;
+    background: var(--page-bg); color: var(--bar-fg);
+    font: 13px/1.4 system-ui, sans-serif;
+  }
+
+  /* Toolbar: compact, single row, wraps on narrow windows. */
+  #bar {
+    flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    padding: 6px 10px; background: var(--bar-bg);
+    border-bottom: 1px solid #000;
+  }
+  #bar label { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  #bar input[type=text] { flex: 1 1 300px; min-width: 200px; }
+  #bar input, #bar button {
+    font: inherit; color: var(--bar-fg); background: #2d333b;
+    border: 1px solid #444c56; border-radius: 4px; padding: 2px 6px;
+  }
+  #bar input[type=number] { width: 5.5em; text-align: right; }
+  #bar button { cursor: pointer; }
+  #bar button:hover { border-color: var(--accent); }
+  #bar .muted { color: var(--bar-muted); }
+  #bar .spacer { flex: 1 1 0; }
+
+  /* The one scrolling viewport. Everything inside scrolls together. */
+  #view { flex: 1 1 0; overflow: auto; cursor: grab; }
+  #view.panning { cursor: grabbing; user-select: none; }
+
+  /* Canvas is exactly the image's rendered size, so sticky and the scrollbars
+     see one consistent width. */
+  #canvas { position: relative; width: max-content; }
+
+  /* Frozen header: position:sticky pins it to the top edge of #view while
+     vertical scrolling moves the rest, but it still scrolls horizontally with
+     the canvas (sticky only constrains the axis you give it). It shows the top
+     `headerPx` image-pixels of a second copy of the same image. */
+  #frozen {
+    position: sticky; top: 0; z-index: 2;
+    overflow: hidden; background: #fff;
+    box-shadow: 0 3px 8px rgba(0,0,0,.45);
+  }
+  #frozen img { display: block; }
+  #frozen { cursor: ns-resize; }
+
+  /* Drag handle on the bottom edge of the frozen strip to resize it. */
+  #handle {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 7px;
+    cursor: row-resize; background: var(--accent); opacity: .55;
+  }
+  #handle:hover, #handle.active { opacity: 1; }
+
+  /* The full image. Its top `headerPx` rows duplicate the frozen strip, so at
+     scroll 0 they are tucked underneath it via a negative margin and the page
+     looks like one seamless image. */
+  #main { display: block; position: relative; z-index: 1; background: #fff; }
+
+  #empty {
+    padding: 40px; max-width: 60em; color: var(--bar-fg);
+  }
+  #empty code { background: #2d333b; padding: 1px 4px; border-radius: 3px; }
+  #err { color: #ff7b72; padding: 20px 40px; display: none; }
+</style>
+</head>
+<body>
+
+<div id="bar">
+  <label>Image <input type="text" id="src" placeholder="URL or path of a PNG / SVG sequence diagram" spellcheck="false"></label>
+  <label title="Frozen strip = image rows [top, top + height), in image pixels at 100%. Rows above `top` are dropped entirely. Drag the strip up/down to change top; drag the blue bar to change height.">
+    Header top <input type="number" id="top" min="0" step="10">
+    height <input type="number" id="header" min="0" step="10"> <span class="muted">px</span>
+  </label>
+  <label title="Render scale relative to the image's natural pixel size. Browser zoom (Ctrl +/-) stacks on top of this.">
+    Zoom <button id="zoomOut">&minus;</button>
+    <input type="number" id="zoom" min="5" max="800" step="5"> <span class="muted">%</span>
+    <button id="zoomIn">+</button>
+    <button id="fitW" title="Scale so the full width fits the window">Fit width</button>
+    <button id="zoom100" title="1 image pixel = 1 CSS pixel">100%</button>
+  </label>
+  <span class="spacer"></span>
+  <span class="muted" id="dims"></span>
+</div>
+
+<div id="view">
+  <div id="empty">
+    <p>Give this page an image to show, via query string or hash:</p>
+    <p><code>?src=/internal/2026-11-02/ms-a2-secure-boot-chains/diagrams/3-this-repo.png</code></p>
+    <p>Optional: <code>&amp;top=0</code> (image rows above this are dropped),
+       <code>&amp;header=260</code> (image px frozen below that),
+       <code>&amp;zoom=100</code> (percent of natural size),
+       <code>&amp;x=0&amp;y=0</code> (scroll position in image px). Settings and
+       scroll position are written back to the hash as you go, so the URL in the
+       address bar always marks the spot you are looking at.</p>
+    <p>Drag anywhere to pan; drag the frozen strip up/down to shift which rows
+       it shows; drag the blue bar to resize it;
+       <kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> zoom; browser zoom also works.</p>
+  </div>
+  <div id="err"></div>
+  <div id="canvas" hidden>
+    <div id="frozen">
+      <img id="topImg" alt="" draggable="false">
+      <div id="handle" title="Drag to resize the frozen header"></div>
+    </div>
+    <img id="main" alt="Sequence diagram" draggable="false">
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const view = $('view'), canvas = $('canvas'), frozen = $('frozen');
+  const topImg = $('topImg'), main = $('main'), handle = $('handle');
+  const srcIn = $('src'), headerIn = $('header'), topIn = $('top'), zoomIn = $('zoom');
+
+  // State. headerPx and zoom are expressed in image pixels / percent of
+  // natural size so that the frozen region is a fixed slice of the diagram
+  // regardless of zoom level.
+  // topPx is the first image row shown; rows above it are dropped (they are
+  // typically a title line and padding that only cost viewing space).
+  const st = { src: '', topPx: 0, headerPx: 260, zoom: 100, natW: 0, natH: 0 };
+
+  // ---- URL <-> state ------------------------------------------------------
+  // Read query string first, then hash (hash wins). Write back to the hash
+  // only, so adjusting settings never triggers a reload.
+  function readURL() {
+    const q = new URLSearchParams(location.search);
+    const h = new URLSearchParams(location.hash.replace(/^#/, ''));
+    const get = k => h.get(k) ?? q.get(k);
+    st.src = get('src') || get('url') || get('img') || '';
+    const tp = parseFloat(get('top'));    if (!isNaN(tp)) st.topPx = tp;
+    const hp = parseFloat(get('header')); if (!isNaN(hp)) st.headerPx = hp;
+    const z = parseFloat(get('zoom'));    if (!isNaN(z))  st.zoom = z;
+    const x = parseFloat(get('x')), y = parseFloat(get('y'));
+    st.x = isNaN(x) ? null : x; st.y = isNaN(y) ? null : y;
+  }
+  let writeTimer;
+  function writeURL() {
+    clearTimeout(writeTimer);
+    writeTimer = setTimeout(() => {
+      const h = new URLSearchParams();
+      if (st.src) h.set('src', st.src);
+      h.set('top', Math.round(st.topPx));
+      h.set('header', Math.round(st.headerPx));
+      h.set('zoom', +st.zoom.toFixed(1));
+      // Scroll position in image pixels, so a URL marks a spot in the diagram.
+      const s = st.zoom / 100;
+      h.set('x', Math.round(view.scrollLeft / s));
+      h.set('y', Math.round(view.scrollTop / s + st.topPx));
+      history.replaceState(null, '', '#' + h.toString());
+    }, 150);
+  }
+
+  // ---- Rendering ----------------------------------------------------------
+  function applyLayout() {
+    const s = st.zoom / 100;
+    st.topPx = Math.max(0, Math.min(st.natH || 1e9, st.topPx));
+    st.headerPx = Math.max(0, Math.min((st.natH || 1e9) - st.topPx, st.headerPx));
+    const w = st.natW * s, off = st.topPx * s, hdr = st.headerPx * s;
+    canvas.style.width = w + 'px';
+    topImg.style.width = w + 'px';
+    main.style.width = w + 'px';
+    frozen.style.height = hdr + 'px';
+    // The strip shows image rows [top, top+header): shift its copy up by top.
+    topImg.style.marginTop = (-off) + 'px';
+    // The body starts right after those rows, tucked under the strip, so the
+    // dropped rows and the duplicated strip rows take no space at scroll 0.
+    // Image row r therefore sits at canvas y = (r - top) * s.
+    main.style.marginTop = (-(off + hdr)) + 'px';
+    topIn.value = Math.round(st.topPx);
+    headerIn.value = Math.round(st.headerPx);
+    zoomIn.value = +st.zoom.toFixed(1);
+    $('dims').textContent = st.natW ? `${st.natW}×${st.natH} px` : '';
+  }
+
+  // Change zoom while keeping the point at the viewport centre fixed.
+  function setZoom(z, anchor) {
+    z = Math.max(5, Math.min(800, z));
+    if (!st.natW) { st.zoom = z; applyLayout(); writeURL(); return; }
+    const old = st.zoom / 100, nu = z / 100;
+    const ax = anchor ? anchor.x : view.clientWidth / 2;
+    const ay = anchor ? anchor.y : view.clientHeight / 2;
+    // Image coordinate under the anchor, before the change. The frozen strip
+    // offsets nothing horizontally, and vertically the main image starts at
+    // canvas top (its negative margin cancels the strip's height).
+    const ix = (view.scrollLeft + ax) / old;
+    const iy = (view.scrollTop + ay) / old;
+    st.zoom = z;
+    applyLayout();
+    view.scrollLeft = ix * nu - ax;
+    view.scrollTop = iy * nu - ay;
+    writeURL();
+  }
+  function setHeader(px) { st.headerPx = px; applyLayout(); writeURL(); }
+  // Changing top shifts the whole canvas by the same amount, so compensate
+  // the scroll to keep the body where it is.
+  function setTop(px) {
+    const before = st.topPx;
+    st.topPx = px; applyLayout();
+    view.scrollTop -= (st.topPx - before) * st.zoom / 100;
+    writeURL();
+  }
+  function fitWidth() {
+    if (!st.natW) return;
+    setZoom(100 * (view.clientWidth - 2) / st.natW);
+  }
+
+  function load(src) {
+    st.src = src;
+    srcIn.value = src;
+    $('err').style.display = 'none';
+    if (!src) { canvas.hidden = true; $('empty').hidden = false; return; }
+    $('empty').hidden = true;
+    const probe = new Image();
+    probe.onload = () => {
+      st.natW = probe.naturalWidth; st.natH = probe.naturalHeight;
+      topImg.src = src; main.src = src;
+      canvas.hidden = false;
+      applyLayout();
+      if (st.x != null) view.scrollLeft = st.x * st.zoom / 100;
+      if (st.y != null) view.scrollTop = (st.y - st.topPx) * st.zoom / 100;
+      writeURL();
+      document.title = src.split('/').pop() + ' – sequence viewer';
+    };
+    probe.onerror = () => {
+      canvas.hidden = true;
+      const e = $('err'); e.style.display = 'block';
+      e.textContent = 'Could not load image: ' + src;
+    };
+    probe.src = src;
+  }
+
+  // ---- Controls -----------------------------------------------------------
+  srcIn.addEventListener('change', () => load(srcIn.value.trim()));
+  headerIn.addEventListener('change', () => setHeader(parseFloat(headerIn.value) || 0));
+  topIn.addEventListener('change', () => setTop(parseFloat(topIn.value) || 0));
+  zoomIn.addEventListener('change', () => setZoom(parseFloat(zoomIn.value) || 100));
+  $('zoomIn').onclick = () => setZoom(st.zoom * 1.25);
+  $('zoomOut').onclick = () => setZoom(st.zoom / 1.25);
+  $('zoom100').onclick = () => setZoom(100);
+  $('fitW').onclick = fitWidth;
+
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === '+' || e.key === '=') setZoom(st.zoom * 1.25);
+    else if (e.key === '-' || e.key === '_') setZoom(st.zoom / 1.25);
+    else if (e.key === '0') setZoom(100);
+    else if (e.key === 'f') fitWidth();
+    else return;
+    e.preventDefault();
+  });
+
+  // Drag the strip's bottom edge to resize the frozen header. Screen delta is
+  // divided by zoom so the value stays in image pixels.
+  handle.addEventListener('pointerdown', e => {
+    e.preventDefault(); e.stopPropagation();
+    handle.setPointerCapture(e.pointerId); handle.classList.add('active');
+    const y0 = e.clientY, h0 = st.headerPx;
+    const move = ev => setHeader(h0 + (ev.clientY - y0) / (st.zoom / 100));
+    const up = () => {
+      handle.classList.remove('active');
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+  });
+
+  // Drag the strip's contents up/down to shift which rows it shows. Moving
+  // the content down (positive dy) reveals earlier rows, so top decreases.
+  frozen.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || e.target === handle) return;
+    e.preventDefault(); e.stopPropagation();
+    frozen.setPointerCapture(e.pointerId);
+    const y0 = e.clientY, t0 = st.topPx;
+    const move = ev => setTop(t0 - (ev.clientY - y0) / (st.zoom / 100));
+    const up = () => {
+      frozen.removeEventListener('pointermove', move);
+      frozen.removeEventListener('pointerup', up);
+    };
+    frozen.addEventListener('pointermove', move);
+    frozen.addEventListener('pointerup', up);
+  });
+
+  // Drag-to-pan anywhere in the viewport (primary button).
+  view.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || e.target === handle) return;
+    const x0 = e.clientX, y0 = e.clientY, sl = view.scrollLeft, stp = view.scrollTop;
+    view.setPointerCapture(e.pointerId); view.classList.add('panning');
+    const move = ev => { view.scrollLeft = sl - (ev.clientX - x0); view.scrollTop = stp - (ev.clientY - y0); };
+    const up = () => {
+      view.classList.remove('panning');
+      view.removeEventListener('pointermove', move);
+      view.removeEventListener('pointerup', up);
+      view.removeEventListener('pointercancel', up);
+    };
+    view.addEventListener('pointermove', move);
+    view.addEventListener('pointerup', up);
+    view.addEventListener('pointercancel', up);
+  });
+
+  // Browser zoom (Ctrl +/- or Ctrl+wheel) is left to the browser: the page is
+  // plain CSS pixels, so it scales the whole thing, frozen strip included.
+
+  view.addEventListener('scroll', writeURL, { passive: true });
+
+  window.addEventListener('hashchange', () => {
+    const before = st.src;
+    readURL();
+    if (st.src !== before) load(st.src); else applyLayout();
+  });
+
+  readURL();
+  load(st.src);
+})();
+</script>
+</body>
+</html>
